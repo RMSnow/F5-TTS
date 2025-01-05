@@ -5,12 +5,16 @@ import re
 from datetime import datetime
 from importlib.resources import files
 from pathlib import Path
-
+from glob import glob
+from tqdm import tqdm
+import json
 import numpy as np
 import soundfile as sf
 import tomli
-from cached_path import cached_path
+
+# from cached_path import cached_path
 from omegaconf import OmegaConf
+from huggingface_hub import hf_hub_download
 
 from f5_tts.infer.utils_infer import (
     mel_spec_type,
@@ -39,7 +43,10 @@ parser.add_argument(
     "-c",
     "--config",
     type=str,
-    default=os.path.join(files("f5_tts").joinpath("infer/examples/basic"), "basic.toml"),
+    # default=os.path.join(
+    #     files("f5_tts").joinpath("infer/examples/basic"), "basic.toml"
+    # ),
+    default="/storage/zhangxueyao/workspace/F5-TTS/src/f5_tts/infer/examples/basic/basic.toml",
     help="The configuration file, default see infer/examples/basic/basic.toml",
 )
 
@@ -162,6 +169,8 @@ parser.add_argument(
     type=float,
     help=f"Fix the total duration (ref and gen audios) in seconds, default {fix_duration}",
 )
+parser.add_argument("--start", type=int, default=0, help="起始pair索引")
+parser.add_argument("--end", type=int, default=10, help="结束pair索引")
 args = parser.parse_args()
 
 
@@ -173,17 +182,24 @@ config = tomli.load(open(args.config, "rb"))
 # command-line interface parameters
 
 model = args.model or config.get("model", "F5-TTS")
-model_cfg = args.model_cfg or config.get("model_cfg", str(files("f5_tts").joinpath("configs/F5TTS_Base_train.yaml")))
+model_cfg = args.model_cfg or config.get(
+    "model_cfg",
+    "/storage/zhangxueyao/workspace/F5-TTS/src/f5_tts/configs/F5TTS_Base_train.yaml",
+)
 ckpt_file = args.ckpt_file or config.get("ckpt_file", "")
 vocab_file = args.vocab_file or config.get("vocab_file", "")
 
-ref_audio = args.ref_audio or config.get("ref_audio", "infer/examples/basic/basic_ref_en.wav")
+ref_audio = args.ref_audio or config.get(
+    "ref_audio", "infer/examples/basic/basic_ref_en.wav"
+)
 ref_text = (
     args.ref_text
     if args.ref_text is not None
     else config.get("ref_text", "Some call me nature, others call me mother nature.")
 )
-gen_text = args.gen_text or config.get("gen_text", "Here we generate something just for test.")
+gen_text = args.gen_text or config.get(
+    "gen_text", "Here we generate something just for test."
+)
 gen_file = args.gen_file or config.get("gen_file", "")
 
 output_dir = args.output_dir or config.get("output_dir", "tests")
@@ -193,14 +209,20 @@ output_file = args.output_file or config.get(
 
 save_chunk = args.save_chunk or config.get("save_chunk", False)
 remove_silence = args.remove_silence or config.get("remove_silence", False)
-load_vocoder_from_local = args.load_vocoder_from_local or config.get("load_vocoder_from_local", False)
+load_vocoder_from_local = args.load_vocoder_from_local or config.get(
+    "load_vocoder_from_local", False
+)
 
 vocoder_name = args.vocoder_name or config.get("vocoder_name", mel_spec_type)
 target_rms = args.target_rms or config.get("target_rms", target_rms)
-cross_fade_duration = args.cross_fade_duration or config.get("cross_fade_duration", cross_fade_duration)
+cross_fade_duration = args.cross_fade_duration or config.get(
+    "cross_fade_duration", cross_fade_duration
+)
 nfe_step = args.nfe_step or config.get("nfe_step", nfe_step)
 cfg_strength = args.cfg_strength or config.get("cfg_strength", cfg_strength)
-sway_sampling_coef = args.sway_sampling_coef or config.get("sway_sampling_coef", sway_sampling_coef)
+sway_sampling_coef = args.sway_sampling_coef or config.get(
+    "sway_sampling_coef", sway_sampling_coef
+)
 speed = args.speed or config.get("speed", speed)
 fix_duration = args.fix_duration or config.get("fix_duration", fix_duration)
 
@@ -214,7 +236,9 @@ if "voices" in config:
     for voice in config["voices"]:
         voice_ref_audio = config["voices"][voice]["ref_audio"]
         if "infer/examples/" in voice_ref_audio:
-            config["voices"][voice]["ref_audio"] = str(files("f5_tts").joinpath(f"{voice_ref_audio}"))
+            config["voices"][voice]["ref_audio"] = str(
+                files("f5_tts").joinpath(f"{voice_ref_audio}")
+            )
 
 
 # ignore gen_text if gen_file provided
@@ -240,7 +264,11 @@ if vocoder_name == "vocos":
 elif vocoder_name == "bigvgan":
     vocoder_local_path = "../checkpoints/bigvgan_v2_24khz_100band_256x"
 
-vocoder = load_vocoder(vocoder_name=vocoder_name, is_local=load_vocoder_from_local, local_path=vocoder_local_path)
+vocoder = load_vocoder(
+    vocoder_name=vocoder_name,
+    is_local=load_vocoder_from_local,
+    local_path=vocoder_local_path,
+)
 
 
 # load TTS model
@@ -253,13 +281,18 @@ if model == "F5-TTS":
             repo_name = "F5-TTS"
             exp_name = "F5TTS_Base"
             ckpt_step = 1200000
-            ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors"))
+            ckpt_file = hf_hub_download(
+                repo_id=f"SWivid/{repo_name}",
+                filename=f"{exp_name}/model_{ckpt_step}.safetensors",
+            )
             # ckpt_file = f"ckpts/{exp_name}/model_{ckpt_step}.pt"  # .pt | .safetensors; local path
         elif vocoder_name == "bigvgan":
             repo_name = "F5-TTS"
             exp_name = "F5TTS_Base_bigvgan"
             ckpt_step = 1250000
-            ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.pt"))
+            ckpt_file = str(
+                cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.pt")
+            )
 
 elif model == "E2-TTS":
     assert args.model_cfg is None, "E2-TTS does not support custom model_cfg yet"
@@ -270,11 +303,17 @@ elif model == "E2-TTS":
         repo_name = "E2-TTS"
         exp_name = "E2TTS_Base"
         ckpt_step = 1200000
-        ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors"))
+        ckpt_file = str(
+            cached_path(
+                f"hf://SWivid/{repo_name}/{exp_name}/model_{ckpt_step}.safetensors"
+            )
+        )
         # ckpt_file = f"ckpts/{exp_name}/model_{ckpt_step}.pt"  # .pt | .safetensors; local path
 
 print(f"Using {model}...")
-ema_model = load_model(model_cls, model_cfg, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file)
+ema_model = load_model(
+    model_cls, model_cfg, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file
+)
 
 
 # inference process
@@ -290,8 +329,10 @@ def main():
     for voice in voices:
         print("Voice:", voice)
         print("ref_audio ", voices[voice]["ref_audio"])
-        voices[voice]["ref_audio"], voices[voice]["ref_text"] = preprocess_ref_audio_text(
-            voices[voice]["ref_audio"], voices[voice]["ref_text"]
+        voices[voice]["ref_audio"], voices[voice]["ref_text"] = (
+            preprocess_ref_audio_text(
+                voices[voice]["ref_audio"], voices[voice]["ref_text"]
+            )
         )
         print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
 
@@ -337,7 +378,10 @@ def main():
             if len(gen_text_) > 200:
                 gen_text_ = gen_text_[:200] + " ... "
             sf.write(
-                os.path.join(output_chunk_dir, f"{len(generated_audio_segments)-1}_{gen_text_}.wav"),
+                os.path.join(
+                    output_chunk_dir,
+                    f"{len(generated_audio_segments)-1}_{gen_text_}.wav",
+                ),
                 audio_segment,
                 final_sample_rate,
             )
@@ -356,5 +400,172 @@ def main():
             print(f.name)
 
 
+def infer_one_sample(
+    ref_audio,
+    ref_text,
+    gen_text,
+    output_path,
+    ref_audio_duration,
+    gen_audio_duration=None,
+):
+    main_voice = {"ref_audio": ref_audio, "ref_text": ref_text}
+    if "voices" not in config:
+        voices = {"main": main_voice}
+    else:
+        voices = config["voices"]
+        voices["main"] = main_voice
+    for voice in voices:
+        print("Voice:", voice)
+        print("ref_audio ", voices[voice]["ref_audio"])
+        voices[voice]["ref_audio"], voices[voice]["ref_text"] = (
+            preprocess_ref_audio_text(
+                voices[voice]["ref_audio"], voices[voice]["ref_text"]
+            )
+        )
+        print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
+
+    generated_audio_segments = []
+    reg1 = r"(?=\[\w+\])"
+    chunks = re.split(reg1, gen_text)
+    reg2 = r"\[(\w+)\]"
+    for text in chunks:
+        if not text.strip():
+            continue
+        match = re.match(reg2, text)
+        if match:
+            voice = match[1]
+        else:
+            print("No voice tag found, using main.")
+            voice = "main"
+        if voice not in voices:
+            print(f"Voice {voice} not found, using main.")
+            voice = "main"
+        text = re.sub(reg2, "", text)
+        ref_audio_ = voices[voice]["ref_audio"]
+        ref_text_ = voices[voice]["ref_text"]
+        gen_text_ = text.strip()
+        print(f"Voice: {voice}")
+
+        if gen_audio_duration is not None:
+            target_duration = ref_audio_duration + gen_audio_duration
+        else:
+            target_duration = fix_duration
+
+        audio_segment, final_sample_rate, spectragram = infer_process(
+            ref_audio_,
+            ref_text_,
+            gen_text_,
+            ema_model,
+            vocoder,
+            mel_spec_type=vocoder_name,
+            target_rms=target_rms,
+            cross_fade_duration=cross_fade_duration,
+            nfe_step=nfe_step,
+            cfg_strength=cfg_strength,
+            sway_sampling_coef=sway_sampling_coef,
+            speed=speed,
+            fix_duration=target_duration,
+        )
+        generated_audio_segments.append(audio_segment)
+
+        if save_chunk:
+            if len(gen_text_) > 200:
+                gen_text_ = gen_text_[:200] + " ... "
+            sf.write(
+                os.path.join(
+                    output_chunk_dir,
+                    f"{len(generated_audio_segments)-1}_{gen_text_}.wav",
+                ),
+                audio_segment,
+                final_sample_rate,
+            )
+
+    if generated_audio_segments:
+        final_wave = np.concatenate(generated_audio_segments)
+
+        with open(output_path, "wb") as f:
+            sf.write(f.name, final_wave, final_sample_rate)
+            # Remove silence
+            # if remove_silence:
+            #     remove_silence_for_generated_wav(f.name)
+
+
 if __name__ == "__main__":
-    main()
+    duration_ratio_list = [0.8, 0.9, 1.0, 1.1, 1.2]
+
+    save_root = "/storage/zhangxueyao/dataset/data_rlhf/rlhfv1"
+    os.makedirs(save_root, exist_ok=True)
+
+    # Load target duration (gt)
+    with open(os.path.join(save_root, "metainfo.json"), "r", encoding="utf-8") as f:
+        metainfo = json.load(f)
+
+    prompt_duration_dict = {
+        meta["id"]: meta["reference"]["duration"] for meta in metainfo
+    }
+    target_duration_dict = {meta["id"]: meta["target"]["duration"] for meta in metainfo}
+
+    group_dirs = glob(os.path.join(save_root, "ar_soundstorm/*"))
+    group_dirs.sort()
+
+    for group_dir in tqdm(group_dirs):
+        group_name = os.path.basename(group_dir)
+
+        pair_dirs = glob(os.path.join(group_dir, "*"))
+        pair_dirs.sort()
+
+        for pair_dir in tqdm(pair_dirs):
+            pair_name = os.path.basename(pair_dir)
+
+            # 获取pair索引并检查是否在指定范围内
+            pair_index = int(pair_name.split("_")[-1])
+            if pair_index < args.start or pair_index >= args.end:
+                continue
+
+            pair_save_root = os.path.join(save_root, "f5tts", group_name, pair_name)
+            os.makedirs(pair_save_root, exist_ok=True)
+
+            text_path = os.path.join(pair_dir, "text.txt")
+            prompt_wav_path = os.path.join(pair_dir, "prompt.mp3")
+
+            # 1. Save prompt.mp3 and text.txt
+            if pair_dir != pair_save_root:
+                os.system(
+                    'cp "{}" "{}"'.format(
+                        prompt_wav_path,
+                        os.path.join(pair_save_root, "prompt.mp3"),
+                    )
+                )
+                os.system(
+                    'cp "{}" "{}"'.format(
+                        text_path,
+                        os.path.join(pair_save_root, "text.txt"),
+                    )
+                )
+
+            with open(text_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                lines = [line.strip() for line in lines]
+
+                prompt_text = lines[0]
+                target_text = lines[1]
+
+            prompt_duration = prompt_duration_dict[pair_name]
+            target_duration = target_duration_dict[pair_name]
+
+            for ratio in duration_ratio_list:
+                output_audio_file = os.path.join(
+                    pair_save_root,
+                    "output_recovered_audio_dur{}.wav".format(ratio),
+                )
+                if os.path.exists(output_audio_file):
+                    continue
+
+                infer_one_sample(
+                    ref_audio=prompt_wav_path,
+                    ref_text=prompt_text,
+                    gen_text=target_text,
+                    output_path=output_audio_file,
+                    ref_audio_duration=prompt_duration,
+                    gen_audio_duration=target_duration * ratio,
+                )
