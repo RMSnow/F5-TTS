@@ -82,18 +82,21 @@ parser.add_argument(
     "--ref_audio",
     type=str,
     help="The reference audio file.",
+    default="/storage/zhangxueyao/workspace/F5-TTS/00000309-00000300.wav",  # Fake ref audio, just a placeholder
 )
 parser.add_argument(
     "-s",
     "--ref_text",
     type=str,
     help="The transcript/subtitle for the reference audio",
+    default="fake_ref_text",  # Fake ref text, just a placeholder
 )
 parser.add_argument(
     "-t",
     "--gen_text",
     type=str,
     help="The text to make model synthesize a speech",
+    default="fake_gen_text",  # Fake gen text, just a placeholder
 )
 parser.add_argument(
     "-f",
@@ -169,8 +172,11 @@ parser.add_argument(
     type=float,
     help=f"Fix the total duration (ref and gen audios) in seconds, default {fix_duration}",
 )
-parser.add_argument("--start", type=int, default=0, help="起始pair索引")
-parser.add_argument("--end", type=int, default=10, help="结束pair索引")
+parser.add_argument("--save_root", type=str, required=True)
+parser.add_argument("--model_name", type=str, required=True)
+parser.add_argument("--evalset_root", type=str, required=True)
+parser.add_argument("--eval_setting", type=str, required=True)
+parser.add_argument("--task_name", type=str, required=True, help="tts, vc, or svc")
 args = parser.parse_args()
 
 
@@ -490,90 +496,68 @@ def infer_one_sample(
             #     remove_silence_for_generated_wav(f.name)
 
 
+def load_evalset(evalset_name):
+    if "svcc2025" in evalset_root:
+        evalset_file = os.path.join(evalset_root, f"{evalset_name}.json")
+    else:
+        evalset_file = os.path.join(evalset_root, evalset_name, "evalset.json")
+
+    with open(evalset_file, "r") as f:
+        evalset = json.load(f)
+    return evalset
+
+
 if __name__ == "__main__":
-    # duration_ratio_list = [0.8, 0.9, 1.0, 1.1, 1.2]
-    # save_root = "/storage/zhangxueyao/dataset/data_rlhf/rlhfv1_codeswitching"
-    # os.makedirs(save_root, exist_ok=True)
+    evalset_root = args.evalset_root
+    evalset_name = args.eval_setting
+    evalset = load_evalset(evalset_name)
 
-    # # For repetition data, increase duration ratio
-    # duration_ratio_list = [0.9, 1.0, 1.1, 1.2, 1.3]
-    # save_root = "/storage/zhangxueyao/dataset/data_rlhf/rlhfv1_repetition"
-    # os.makedirs(save_root, exist_ok=True)
+    print("\nFor {}...".format(evalset_name))
+    save_dir = os.path.join(args.save_root, args.task_name, evalset_name)
+    os.makedirs(save_dir, exist_ok=True)
 
-    duration_ratio_list = [1.0]
-    save_root = "/storage/zhangxueyao/dataset/data_rlhf/rlhfv1_mistakable_prosody"
-    os.makedirs(save_root, exist_ok=True)
+    for item in tqdm(evalset):
+        output_filename = "{}-{}-{}".format(
+            args.model_name, evalset_name, item["output_path"]
+        )
+        output_path = os.path.join(save_dir, output_filename)
+        if os.path.exists(output_path):
+            continue
 
-    # Load target duration (gt)
-    with open(os.path.join(save_root, "metainfo.json"), "r", encoding="utf-8") as f:
-        metainfo = json.load(f)
+        if args.task_name in ["tts", "vc"]:
+            src_text = item["input"]["text"]
+            ref_text = item["prompt"]["text"]
+            ref_wav_path = os.path.join(
+                evalset_root,
+                evalset_name,
+                "wav",
+                "{}.wav".format(item["prompt"]["uid"]),
+            )
 
-    prompt_duration_dict = {
-        meta["id"]: meta["reference"]["duration"] for meta in metainfo
-    }
-    target_duration_dict = {meta["id"]: meta["target"]["duration"] for meta in metainfo}
+            infer_one_sample(
+                ref_audio=ref_wav_path,
+                ref_text=ref_text,
+                gen_text=src_text,
+                output_path=output_path,
+                ref_audio_duration=item["prompt"]["duration"],
+            )
 
-    group_dirs = glob(os.path.join(save_root, "ar_soundstorm/*"))
-    group_dirs.sort()
+        else:
+            raise NotImplementedError("Not implemented yet")
 
-    for group_dir in tqdm(group_dirs):
-        group_name = os.path.basename(group_dir)
+    ### Eval ###
+    eval_log_dir = os.path.join(args.save_root, "log_eval")
+    os.makedirs(eval_log_dir, exist_ok=True)
 
-        pair_dirs = glob(os.path.join(group_dir, "*"))
-        pair_dirs.sort()
+    eval_log_file = os.path.join(
+        eval_log_dir, f"{args.task_name}_{args.eval_setting}.log"
+    )
 
-        for pair_dir in tqdm(pair_dirs):
-            pair_name = os.path.basename(pair_dir)
-
-            # 获取pair索引并检查是否在指定范围内
-            pair_index = int(pair_name.split("_")[-1])
-            if pair_index < args.start or pair_index >= args.end:
-                continue
-
-            pair_save_root = os.path.join(save_root, "f5tts", group_name, pair_name)
-            os.makedirs(pair_save_root, exist_ok=True)
-
-            text_path = os.path.join(pair_dir, "text.txt")
-            prompt_wav_path = os.path.join(pair_dir, "prompt.mp3")
-
-            # 1. Save prompt.mp3 and text.txt
-            if pair_dir != pair_save_root:
-                os.system(
-                    'cp "{}" "{}"'.format(
-                        prompt_wav_path,
-                        os.path.join(pair_save_root, "prompt.mp3"),
-                    )
-                )
-                os.system(
-                    'cp "{}" "{}"'.format(
-                        text_path,
-                        os.path.join(pair_save_root, "text.txt"),
-                    )
-                )
-
-            with open(text_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-                lines = [line.strip() for line in lines]
-
-                prompt_text = lines[0]
-                target_text = lines[1]
-
-            prompt_duration = prompt_duration_dict[pair_name]
-            target_duration = target_duration_dict[pair_name]
-
-            for ratio in duration_ratio_list:
-                output_audio_file = os.path.join(
-                    pair_save_root,
-                    "output_recovered_audio_dur{}.wav".format(ratio),
-                )
-                if os.path.exists(output_audio_file):
-                    continue
-
-                infer_one_sample(
-                    ref_audio=prompt_wav_path,
-                    ref_text=prompt_text,
-                    gen_text=target_text,
-                    output_path=output_audio_file,
-                    ref_audio_duration=prompt_duration,
-                    gen_audio_duration=target_duration * ratio,
-                )
+    os.system(
+        f"python /storage/zhangxueyao/workspace/SpeechGenerationYC/models/svc/llm/evaluation/eval_wer_sim_fpc.py \
+    --save_root {args.save_root} \
+    --model_name {args.model_name} \
+    --evalset_root {args.evalset_root} \
+    --eval_setting {args.eval_setting} \
+    --task_name {args.task_name} > {eval_log_file} 2>&1 &"
+    )
