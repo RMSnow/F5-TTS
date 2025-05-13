@@ -32,7 +32,11 @@ from f5_tts.infer.utils_infer import (
     remove_silence_for_generated_wav,
 )
 from f5_tts.model import DiT, UNetT
-
+import torch
+import torchaudio
+import torch.nn.functional as F
+from f5_tts.model.utils import convert_char_to_pinyin
+from f5_tts.infer.utils_infer import save_spectrogram
 
 parser = argparse.ArgumentParser(
     prog="python3 infer-cli.py",
@@ -172,6 +176,11 @@ parser.add_argument(
     type=float,
     help=f"Fix the total duration (ref and gen audios) in seconds, default {fix_duration}",
 )
+parser.add_argument("--save_root", type=str, required=True)
+parser.add_argument("--model_name", type=str, required=True)
+parser.add_argument("--evalset_root", type=str, required=True)
+parser.add_argument("--eval_setting", type=str, required=True)
+parser.add_argument("--task_name", type=str, required=True)
 
 args = parser.parse_args()
 
@@ -493,34 +502,28 @@ def infer_one_sample(
 
 
 def load_evalset(evalset_name):
-    if "svcc2025" in evalset_root:
-        evalset_file = os.path.join(evalset_root, f"{evalset_name}.json")
-    else:
-        evalset_file = os.path.join(evalset_root, evalset_name, "evalset.json")
+    evalset_file = os.path.join(evalset_root, evalset_name, "evalset_with_span.json")
 
     with open(evalset_file, "r") as f:
         evalset = json.load(f)
     return evalset
 
 
-if __name__ == "__main__":
-    import torch
-    import torchaudio
-    import torch.nn.functional as F
-    from f5_tts.model.utils import convert_char_to_pinyin
-    from f5_tts.infer.utils_infer import save_spectrogram
+def run_editing(
+    audio_to_edit,
+    target_text,
+    parts_to_edit,
+    fix_duration=None,
+    output_path=None,
+):
+    # audio_to_edit = "/storage/zhangxueyao/workspace/F5-TTS/src/f5_tts/infer/examples/basic/basic_ref_en.wav"
+    # origin_text = "Some call me nature, others call me mother nature."
+    # target_text = "Some call me optimist, others call me realist."
+    # parts_to_edit = [
+    #     [1.42, 2.44],
+    #     [4.04, 4.9],
+    # ]  # stard_ends of "nature" & "mother nature", in seconds
 
-    audio_to_edit = "/storage/zhangxueyao/workspace/F5-TTS/src/f5_tts/infer/examples/basic/basic_ref_en.wav"
-    origin_text = "Some call me nature, others call me mother nature."
-    target_text = "Some call me optimist, others call me realist."
-    parts_to_edit = [
-        [1.42, 2.44],
-        [4.04, 4.9],
-    ]  # stard_ends of "nature" & "mother nature", in seconds
-    fix_duration = [
-        1.2,
-        1,
-    ]  # fix duration for "optimist" & "realist", in seconds
     target_sample_rate = 24000
     hop_length = 256
     tokenizer = "pinyin"
@@ -609,13 +612,67 @@ if __name__ == "__main__":
         if rms < target_rms:
             generated_wave = generated_wave * rms / target_rms
 
-        output_dir = (
-            "/storage/zhangxueyao/workspace/F5-TTS/src/f5_tts/infer/examples/basic"
+        # output_dir = (
+        #     "/storage/zhangxueyao/workspace/F5-TTS/src/f5_tts/infer/examples/basic"
+        # )
+        # save_spectrogram(
+        #     gen_mel_spec[0].cpu().numpy(), f"{output_dir}/speech_edit_out.png"
+        # )
+        # torchaudio.save(
+        #     f"{output_dir}/speech_edit_out.wav", generated_wave, target_sample_rate
+        # )
+        # print(f"Generated wav: {generated_wave.shape}")
+
+        torchaudio.save(output_path, generated_wave, target_sample_rate)
+
+
+if __name__ == "__main__":
+    evalset_root = args.evalset_root
+    evalset_name = args.eval_setting
+    evalset = load_evalset(evalset_name)
+
+    print("\nFor {}...".format(evalset_name))
+    save_dir = os.path.join(args.save_root, args.task_name, evalset_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    for item in tqdm(evalset):
+        output_filename = "{}-{}-{}".format(
+            args.model_name, evalset_name, item["output_path"]
         )
-        save_spectrogram(
-            gen_mel_spec[0].cpu().numpy(), f"{output_dir}/speech_edit_out.png"
+        output_path = os.path.join(save_dir, output_filename)
+        if os.path.exists(output_path):
+            continue
+
+        raw_text = item["prompt"]["text"]
+        raw_audio = os.path.join(
+            evalset_root,
+            evalset_name,
+            "wav",
+            "{}.wav".format(item["prompt"]["uid"]),
         )
-        torchaudio.save(
-            f"{output_dir}/speech_edit_out.wav", generated_wave, target_sample_rate
+        target_text = item["input"]["text"]
+        parts_to_edit = item["morphed_span"]
+
+        run_editing(
+            audio_to_edit=raw_audio,
+            target_text=target_text,
+            parts_to_edit=parts_to_edit,
+            output_path=output_path,
         )
-        print(f"Generated wav: {generated_wave.shape}")
+
+    ### Eval ###
+    eval_log_dir = os.path.join(args.save_root, "log_eval")
+    os.makedirs(eval_log_dir, exist_ok=True)
+
+    eval_log_file = os.path.join(
+        eval_log_dir, f"{args.task_name}_{args.eval_setting}.log"
+    )
+
+    os.system(
+        f"python /storage/zhangxueyao/workspace/SpeechGenerationYC/models/svc/llm/evaluation/eval_wer_sim_fpc.py \
+    --save_root {args.save_root} \
+    --model_name {args.model_name} \
+    --evalset_root {args.evalset_root} \
+    --eval_setting {args.eval_setting} \
+    --task_name {args.task_name} > {eval_log_file} 2>&1 &"
+    )
